@@ -34,9 +34,9 @@
 Can be `'left', `'right', `'top', or `'bottom'.  This setting will only
 be used when `eca-chat-use-side-window' is non-nil."
   :type '(choice (const :tag "Left" left)
-          (const :tag "Right" right)
-          (const :tag "Top" top)
-          (const :tag "Bottom" bottom))
+                 (const :tag "Right" right)
+                 (const :tag "Top" top)
+                 (const :tag "Bottom" bottom))
   :group 'eca)
 
 (defcustom eca-chat-window-width 0.40
@@ -164,14 +164,14 @@ Must be a valid model supported by server, check `eca-chat-select-model`."
 (defcustom eca-chat-diff-tool 'smerge
   "Select the method for displaying file-change diffs in ECA chat."
   :type '(choice (const :tag "Side-by-side Ediff" ediff)
-          (const :tag "Merge-style Smerge" smerge))
+                 (const :tag "Merge-style Smerge" smerge))
   :group 'eca)
 
 (defcustom eca-chat-tool-call-prepare-throttle 'smart
   "Throttle strategy for handling `toolCallPrepare` events.
 Possible values: `all` or `smart` (default)."
   :type '(choice (const :tag "Process all updates" all)
-          (const :tag "Smart throttle" smart))
+                 (const :tag "Smart throttle" smart))
   :group 'eca)
 
 (defcustom eca-chat-tool-call-prepare-update-interval 5
@@ -190,6 +190,24 @@ Must be a positive integer."
   "The size of font of tool call approval."
   :type 'number
   :group 'eca)
+
+(defcustom eca-chat-user-message-collapse-threshold nil
+  "Minimum message length (in characters) to enable collapsing.
+When non-nil and a user message exceeds this length, it will be
+shown in collapsed form initially.  Set to nil to disable collapsing."
+  :type '(choice (const :tag "Disabled" nil)
+                 (integer :tag "Character threshold"))
+  :group 'eca)
+
+(defcustom eca-chat-user-message-collapse-preview-length 100
+  "Number of characters to show in collapsed user message preview."
+  :type 'integer
+  :group 'eca)
+
+;; Constants
+
+(defconst eca-chat--user-message-id-prefix "user-message-"
+  "Prefix for user message IDs.")
 
 ;; Faces
 
@@ -816,10 +834,10 @@ the prompt/context line."
          (get-text-property 0 'eca-button-on-action)
          (funcall)))
 
-      ;; check is inside a expandable text
-      ((eca-chat--expandable-content-at-point)
-       (let ((ov (eca-chat--expandable-content-at-point)))
-         (eca-chat--expandable-content-toggle (overlay-get ov 'eca-chat--expandable-content-id))))
+      ;; check for interactive elements at point
+      ((or (eca-chat--collapsible-user-message-at-point)
+           (eca-chat--expandable-content-at-point))
+       (eca-chat--handle-interactive-element-at-point))
 
       (t nil)))))
 
@@ -827,10 +845,11 @@ the prompt/context line."
   "Expand tool call if point is at expandable content, or use default behavior."
   (interactive)
   (cond
-   ;; expandable toggle
-   ((eca-chat--expandable-content-at-point)
+   ;; handle interactive elements
+   ((or (eca-chat--collapsible-user-message-at-point)
+        (eca-chat--expandable-content-at-point))
     (eca-chat--allow-write
-     (eca-chat--expandable-content-toggle (overlay-get (eca-chat--expandable-content-at-point) 'eca-chat--expandable-content-id))))
+     (eca-chat--handle-interactive-element-at-point)))
 
    ;; context completion
    ((and (eca-chat--prompt-context-field-ov)
@@ -1005,6 +1024,102 @@ Add a overlay before with OVERLAY-KEY = OVERLAY-VALUE if passed."
       (eca-chat--insert text)
       (point))))
 
+
+
+(defun eca-chat--make-collapsible-keymap (id)
+  "Create keymap for collapsible element with ID."
+  (let ((km (make-sparse-keymap)))
+    (define-key km (kbd "<mouse-1>")
+                (lambda () (interactive)
+                  (eca-chat--toggle-collapsible-user-message id)))
+    (define-key km (kbd "<tab>")
+                (lambda () (interactive)
+                  (eca-chat--toggle-collapsible-user-message id)))
+    km))
+
+(defun eca-chat--find-overlay-with-property (property-key)
+  "Find overlay with PROPERTY-KEY at point or on current line."
+  (or (-first (lambda (ov) (overlay-get ov property-key))
+              (overlays-at (point)))
+      (-first (lambda (ov) (overlay-get ov property-key))
+              (overlays-in (line-beginning-position) (line-end-position)))))
+
+(defun eca-chat--apply-collapsible-properties (start end keymap)
+  "Apply all text properties for collapsible block from START to END with KEYMAP."
+  (put-text-property start end 'line-prefix eca-chat-expandable-block-open-symbol)
+  (put-text-property start end 'font-lock-face 'eca-chat-user-messages-face)
+  (put-text-property start end 'help-echo "mouse-1 / tab / RET: expand/collapse")
+  (put-text-property start end 'mouse-face 'highlight))
+
+(defun eca-chat--propertize-collapsible (text is-collapsed keymap)
+  "Apply properties to TEXT depending on IS-COLLAPSED with KEYMAP."
+  (propertize text
+              'line-prefix (if is-collapsed
+                               eca-chat-expandable-block-open-symbol
+                             eca-chat-expandable-block-close-symbol)
+              'keymap keymap
+              'font-lock-face 'eca-chat-user-messages-face
+              'help-echo "mouse-1 / tab / RET: expand/collapse"))
+
+(defun eca-chat--insert-collapsible-content (text keymap)
+  "Insert TEXT with KEYMAP and return (start . end) cons."
+  (let ((start (point)))
+    (insert text)
+    (insert "\n")
+    (let ((end (1- (point))))
+      (eca-chat--apply-collapsible-properties start end keymap)
+      (cons start end))))
+
+(defun eca-chat--create-collapsible-overlay (start end id message-id collapsed-text expanded-text keymap)
+  "Create overlay for collapsible message from START to END with ID and MESSAGE-ID.
+COLLAPSED-TEXT is the preview text, EXPANDED-TEXT is the full text.
+KEYMAP is the keymap for interactive actions."
+  (let ((ov (make-overlay start end (current-buffer))))
+    (overlay-put ov 'eca-chat--user-message-id message-id)
+    (overlay-put ov 'eca-chat--timestamp (float-time))
+    (overlay-put ov 'eca-chat--collapsible-user-message-id id)
+    (overlay-put ov 'eca-chat--collapsible-user-message-collapsed t)
+    (overlay-put ov 'eca-chat--collapsed-text collapsed-text)
+    (overlay-put ov 'eca-chat--expanded-text expanded-text)
+    (overlay-put ov 'keymap keymap)
+    ov))
+
+(defun eca-chat--create-collapsed-preview (text preview-length)
+  "Create collapsed preview from TEXT with PREVIEW-LENGTH characters.
+Returns cons of (collapsed-text . expanded-text) both propertized."
+  (let* ((text-length (length text))
+         (actual-preview-length (min preview-length text-length))
+         (preview-text (substring text 0 actual-preview-length))
+         (preview-clean (replace-regexp-in-string "[\n\r]+" " " preview-text))
+         (collapsed-text (propertize
+                          (if (> text-length actual-preview-length)
+                              (format "%s... (%d more chars)"
+                                      preview-clean
+                                      (- text-length actual-preview-length))
+                            preview-clean)
+                          'font-lock-face 'eca-chat-user-messages-face))
+         (expanded-text (propertize text 'font-lock-face 'eca-chat-user-messages-face)))
+    (cons collapsed-text expanded-text)))
+
+(defun eca-chat--collapsible-user-message-at-point ()
+  "Return collapsible user message overlay at point, or nil if none."
+  (eca-chat--find-overlay-with-property 'eca-chat--collapsible-user-message-id))
+
+(defun eca-chat--handle-interactive-element-at-point (&optional force-open?)
+  "Handle interactive element at point (collapsible or expandable).
+If FORCE-OPEN? is non-nil, force open expandable elements."
+  (cond
+   ((eca-chat--collapsible-user-message-at-point)
+    (let* ((ov (eca-chat--collapsible-user-message-at-point))
+           (id (overlay-get ov 'eca-chat--collapsible-user-message-id)))
+      (eca-chat--toggle-collapsible-user-message id)))
+   ((eca-chat--expandable-content-at-point)
+    (let ((ov (eca-chat--expandable-content-at-point)))
+      (eca-chat--expandable-content-toggle
+       (overlay-get ov 'eca-chat--expandable-content-id)
+       (when force-open? t)
+       (not force-open?))))))
+
 (defun eca-chat--expandable-content-at-point ()
   "Return expandable content overlay at point, or nil if none."
   (-first (-lambda (ov) (overlay-get ov 'eca-chat--expandable-content-id))
@@ -1017,9 +1132,9 @@ Add a overlay before with OVERLAY-KEY = OVERLAY-VALUE if passed."
 
 (defun eca-chat--propertize-only-first-word (str &rest properties)
   "Return a new string propertizing PROPERTIES to the first word of STR.
-If STR is empty or PROPERTIES is nil, return STR unchanged. Existing
+If STR is empty or PROPERTIES is nil, return STR unchanged.  Existing
 text properties on STR are preserved; only the first word gets the
-additional PROPERTIES. The first word is the substring up to the first
+additional PROPERTIES.  The first word is the substring up to the first
 space, tab, or newline."
   (if (or (string-empty-p str) (null properties))
       str
@@ -1031,6 +1146,38 @@ space, tab, or newline."
       ;; and add/override with the provided PROPERTIES only for the first word.
       (add-text-properties 0 (length first) properties first)
       (concat first rest))))
+(defun eca-chat--add-collapsible-user-message (id collapsed-text expanded-text message-id)
+  "Add a collapsible user message at current position.
+ID is unique identifier, COLLAPSED-TEXT is preview text,
+EXPANDED-TEXT is full text, MESSAGE-ID is for navigation."
+  (save-excursion
+    (let* ((context-start (eca-chat--prompt-area-start-point))
+           (insertion-point (1- context-start))
+           (keymap (eca-chat--make-collapsible-keymap id)))
+      (goto-char insertion-point)
+      (unless (bolp) (insert "\n"))
+      (let* ((range (eca-chat--insert-collapsible-content collapsed-text keymap))
+             (start (car range))
+             (end (cdr range)))
+        (eca-chat--create-collapsible-overlay start end id message-id
+                                              collapsed-text expanded-text keymap)))))
+(defun eca-chat--toggle-collapsible-user-message (id)
+  "Toggle collapsible user message with ID between collapsed and expanded."
+  (when-let* ((ov (-first (lambda (ov) (string= id (overlay-get ov 'eca-chat--collapsible-user-message-id)))
+                          (overlays-in (point-min) (point-max)))))
+    (eca-chat--allow-write
+     (let* ((is-collapsed (overlay-get ov 'eca-chat--collapsible-user-message-collapsed))
+            (text (if is-collapsed
+                      (overlay-get ov 'eca-chat--expanded-text)
+                    (overlay-get ov 'eca-chat--collapsed-text)))
+            (keymap (eca-chat--make-collapsible-keymap id)))
+       (save-excursion
+         (goto-char (overlay-start ov))
+         (delete-region (overlay-start ov) (min (1+ (overlay-end ov)) (point-max)))
+         (insert (eca-chat--propertize-collapsible text (not is-collapsed) keymap))
+         (insert "\n")
+         (move-overlay ov (overlay-start ov) (1- (point)))
+         (overlay-put ov 'eca-chat--collapsible-user-message-collapsed (not is-collapsed)))))))
 
 (defun eca-chat--add-expandable-content (id label content)
   "Add LABEL to the chat current position for ID as a interactive text.
@@ -1733,8 +1880,8 @@ Calls CB with the resulting message."
        (cond
         ((eq action 'metadata)
          '(metadata (category . eca-capf)
-           (display-sort-function . identity)
-           (cycle-sort-function . identity)))
+                    (display-sort-function . identity)
+                    (cycle-sort-function . identity)))
         ((eq (car-safe action) 'boundaries) nil)
         (t
          (complete-with-action action (funcall candidates-fn) probe pred))))
@@ -1757,7 +1904,7 @@ Calls CB with the resulting message."
     (setf (eca--session-chat-selected-behavior session))))
 
 (defun eca-chat--tool-call-file-change-details
-  (content approval-text time status tool-call-next-line-spacing roots)
+    (content approval-text time status tool-call-next-line-spacing roots)
   "Update tool call UI based showing file change details.
 CONTENT is the tool call content.
 Can include optional APPROVAL-TEXT and TIME.
@@ -1818,13 +1965,25 @@ Append STATUS, TOOL-CALL-NEXT-LINE-SPACING and ROOTS"
          (when-let* ((text (plist-get content :text)))
            (pcase role
              ("user"
-              (eca-chat--add-text-content
-               (propertize text
-                           'font-lock-face 'eca-chat-user-messages-face
-                           'line-prefix (propertize eca-chat-prompt-prefix
-                                                    'font-lock-face 'eca-chat-user-messages-face)
-                           'line-spacing 10)
-               'eca-chat--user-message-id eca-chat--last-request-id)
+              (let* ((request-id eca-chat--last-request-id)
+                     (text-length (length text))
+                     (should-collapse (and eca-chat-user-message-collapse-threshold
+                                           (> text-length eca-chat-user-message-collapse-threshold))))
+                (if should-collapse
+                    (let* ((id (format "%s%s" eca-chat--user-message-id-prefix request-id))
+                           (preview-data (eca-chat--create-collapsed-preview
+                                          text
+                                          eca-chat-user-message-collapse-preview-length))
+                           (collapsed-text (car preview-data))
+                           (expanded-text (cdr preview-data)))
+                      (eca-chat--add-collapsible-user-message id collapsed-text expanded-text request-id))
+                  (eca-chat--add-text-content
+                   (propertize text
+                               'font-lock-face 'eca-chat-user-messages-face
+                               'line-prefix (propertize eca-chat-prompt-prefix
+                                                        'font-lock-face 'eca-chat-user-messages-face)
+                               'line-spacing 10)
+                   'eca-chat--user-message-id request-id)))
               (eca-chat--mark-header)
               (font-lock-ensure))
              ("system"
@@ -1881,7 +2040,7 @@ Append STATUS, TOOL-CALL-NEXT-LINE-SPACING and ROOTS"
                 (server (plist-get content :server))
                 (argsText (plist-get content :argumentsText))
                 (label (or (plist-get content :summary)
-                             (format "Preparing tool: %s" name)))
+                           (format "Preparing tool: %s" name)))
                 (current-count (gethash id eca-chat--tool-call-prepare-counters 0))
                 (cached-content (gethash id eca-chat--tool-call-prepare-content-cache ""))
                 (new-content (concat cached-content argsText))
@@ -1913,7 +2072,7 @@ Append STATUS, TOOL-CALL-NEXT-LINE-SPACING and ROOTS"
                 (name (plist-get content :name))
                 (server (plist-get content :server))
                 (label (or (plist-get content :summary)
-                             (format "Calling tool: %s__%s" server name)))
+                           (format "Calling tool: %s__%s" server name)))
                 (manual? (plist-get content :manualApproval))
                 (status eca-chat-mcp-tool-call-loading-symbol)
                 (approval-text (when manual?
@@ -1939,7 +2098,7 @@ Append STATUS, TOOL-CALL-NEXT-LINE-SPACING and ROOTS"
                 (name (plist-get content :name))
                 (server (plist-get content :server))
                 (label (or (plist-get content :summary)
-                             (format "Running tool: %s__%s" server name)))
+                           (format "Running tool: %s__%s" server name)))
                 (details (plist-get content :details))
                 (status eca-chat-mcp-tool-call-loading-symbol))
            (pcase (plist-get details :type)
@@ -1957,7 +2116,7 @@ Append STATUS, TOOL-CALL-NEXT-LINE-SPACING and ROOTS"
                 (name (plist-get content :name))
                 (server (plist-get content :server))
                 (label (or (plist-get content :summary)
-                             (format "Called tool: %s__%s" server name)))
+                           (format "Called tool: %s__%s" server name)))
                 (args (plist-get content :arguments))
                 (outputs (plist-get content :outputs))
                 (output-text (if outputs
@@ -2208,10 +2367,12 @@ Just open if FORCE-OPEN? is non-nil."
   (interactive)
   (eca-assert-session-running (eca-session))
   (eca-chat--with-current-buffer (eca-chat--get-last-buffer (eca-session))
-    (unless (eca-chat--expandable-content-at-point)
+    (unless (or (eca-chat--collapsible-user-message-at-point)
+                (eca-chat--expandable-content-at-point))
       (eca-chat-go-to-prev-expandable-block))
-    (when-let ((ov (eca-chat--expandable-content-at-point)))
-      (eca-chat--expandable-content-toggle (overlay-get ov 'eca-chat--expandable-content-id) (when force-open? t) (not force-open?)))))
+    (when (or (eca-chat--collapsible-user-message-at-point)
+              (eca-chat--expandable-content-at-point))
+      (eca-chat--handle-interactive-element-at-point force-open?))))
 
 ;;;###autoload
 (defun eca-chat-add-context-to-system-prompt ()
